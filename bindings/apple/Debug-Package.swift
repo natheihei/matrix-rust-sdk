@@ -13,7 +13,6 @@ let package = Package(
     ],
     products: [
         .library(name: "MatrixRustSDK",
-                 type: .dynamic,
                  targets: ["MatrixRustSDK"]),
     ],
     targets: [

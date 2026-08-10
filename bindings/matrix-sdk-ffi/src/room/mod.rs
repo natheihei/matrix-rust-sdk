@@ -279,6 +279,13 @@ impl Room {
                     default_event_filter(event, room_version_id) && event_filter.filter(event)
                 });
             }
+
+            TimelineFilter::WithAdditionalEventTypes { event_types } => {
+                builder = builder.event_filter(move |event, room_version_id| {
+                    default_event_filter(event, room_version_id)
+                        || event_types.contains(&event.event_type().to_string())
+                });
+            }
         }
 
         if let Some(internal_id_prefix) = configuration.internal_id_prefix {
