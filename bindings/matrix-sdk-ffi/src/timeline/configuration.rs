@@ -203,6 +203,8 @@ pub enum TimelineFilter {
     },
     /// Show only events which match this event filter.
     EventFilter { filter: Arc<TimelineEventFilter> },
+    /// Show events accepted by the default filter plus the additional event types.
+    WithAdditionalEventTypes { event_types: Vec<String> },
 }
 
 /// Various options used to configure the timeline's behavior.
