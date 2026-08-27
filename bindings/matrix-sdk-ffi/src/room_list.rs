@@ -28,11 +28,12 @@ use matrix_sdk::{
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
     room_list_service::filters::{
-        BoxedFilterFn, RoomCategory, new_filter_all, new_filter_any, new_filter_category,
-        new_filter_deduplicate_versions, new_filter_favourite, new_filter_fuzzy_match_room_name,
-        new_filter_identifiers, new_filter_invite, new_filter_joined, new_filter_low_priority,
-        new_filter_non_left, new_filter_none, new_filter_normalized_match_room_name,
-        new_filter_not, new_filter_space, new_filter_unread,
+        BoxedFilterFn, ReadReceiptsCategory, RoomCategory, new_filter_all, new_filter_any,
+        new_filter_category, new_filter_deduplicate_versions, new_filter_favourite,
+        new_filter_fuzzy_match_room_name, new_filter_identifiers, new_filter_invite,
+        new_filter_joined, new_filter_low_priority, new_filter_non_left, new_filter_none,
+        new_filter_normalized_match_room_name, new_filter_not, new_filter_read_receipts,
+        new_filter_space,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -92,11 +93,11 @@ pub struct RoomListService {
 #[matrix_sdk_ffi_macros::export]
 impl RoomListService {
     fn state(&self, listener: Box<dyn RoomListServiceStateListener>) -> Arc<TaskHandle> {
-        let state_stream = self.inner.state();
+        let mut state_stream = self.inner.state();
+
+        listener.on_update(state_stream.next_now().into());
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(state_stream);
-
             while let Some(state) = state_stream.next().await {
                 listener.on_update(state.into());
             }
@@ -136,7 +137,7 @@ impl RoomListService {
         })))
     }
 
-    async fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
+    async fn set_room_subscriptions(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
         let room_ids = room_ids
             .into_iter()
             .map(|room_id| {
@@ -145,7 +146,7 @@ impl RoomListService {
             .collect::<Result<Vec<_>, _>>()?;
 
         self.inner
-            .subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+            .set_room_subscriptions(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>())
             .await;
 
         Ok(())
@@ -481,32 +482,17 @@ pub enum RoomListEntriesDynamicFilterKind {
     // Not { filter: RoomListEntriesDynamicFilterKind } - requires recursive enum
     // support in uniffi https://github.com/mozilla/uniffi-rs/issues/396
     Joined,
-    Unread,
+    ReadReceipts { expect: ReadReceiptsCategory },
     Favourite,
     LowPriority,
     NonLowPriority,
     NonFavorite,
     Invite,
-    Category { expect: RoomListFilterCategory },
+    Category { expect: RoomCategory },
     None,
     NormalizedMatchRoomName { pattern: String },
     FuzzyMatchRoomName { pattern: String },
     DeduplicateVersions,
-}
-
-#[derive(uniffi::Enum)]
-pub enum RoomListFilterCategory {
-    Group,
-    People,
-}
-
-impl From<RoomListFilterCategory> for RoomCategory {
-    fn from(value: RoomListFilterCategory) -> Self {
-        match value {
-            RoomListFilterCategory::Group => Self::Group,
-            RoomListFilterCategory::People => Self::People,
-        }
-    }
 }
 
 impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
@@ -527,13 +513,13 @@ impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
             Kind::Space => Box::new(new_filter_space()),
             Kind::NonLeft => Box::new(new_filter_non_left()),
             Kind::Joined => Box::new(new_filter_joined()),
-            Kind::Unread => Box::new(new_filter_unread()),
+            Kind::ReadReceipts { expect } => Box::new(new_filter_read_receipts(expect)),
             Kind::Favourite => Box::new(new_filter_favourite()),
             Kind::LowPriority => Box::new(new_filter_low_priority()),
             Kind::NonLowPriority => Box::new(new_filter_not(Box::new(new_filter_low_priority()))),
             Kind::NonFavorite => Box::new(new_filter_not(Box::new(new_filter_favourite()))),
             Kind::Invite => Box::new(new_filter_invite()),
-            Kind::Category { expect } => Box::new(new_filter_category(expect.into())),
+            Kind::Category { expect } => Box::new(new_filter_category(expect)),
             Kind::None => Box::new(new_filter_none()),
             Kind::NormalizedMatchRoomName { pattern } => {
                 Box::new(new_filter_normalized_match_room_name(&pattern))

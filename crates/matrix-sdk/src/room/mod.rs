@@ -1232,6 +1232,23 @@ impl Room {
             .collect())
     }
 
+    /// Get the user IDs of the members with the given memberships, without the
+    /// service members. The current user is part of the result. Fetches the
+    /// member list if it is not synced yet.
+    pub async fn human_member_ids(&self, memberships: RoomMemberships) -> Result<Vec<OwnedUserId>> {
+        self.sync_members().await?;
+        self.human_member_ids_no_sync(memberships).await
+    }
+
+    /// Same as [`Self::human_member_ids`], without a request to the homeserver,
+    /// so members can be missing.
+    pub async fn human_member_ids_no_sync(
+        &self,
+        memberships: RoomMemberships,
+    ) -> Result<Vec<OwnedUserId>> {
+        Ok(self.inner.human_member_ids(memberships).await?)
+    }
+
     /// Sets the display name of the current user within this room.
     ///
     /// *Note*: This is different to [`crate::Account::set_display_name`] which
@@ -3547,7 +3564,7 @@ impl Room {
     ///
     /// * `receipt_type` - The type of receipt to get.
     ///
-    /// * `thread` - The thread containing the event of the receipt, if any.
+    /// * `receipt_thread` - The thread a receipt applies to.
     ///
     /// * `user_id` - The ID of the user.
     ///
@@ -3556,10 +3573,13 @@ impl Room {
     pub async fn load_user_receipt(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         user_id: &UserId,
     ) -> Result<Option<(OwnedEventId, Receipt)>> {
-        self.inner.load_user_receipt(receipt_type, thread, user_id).await.map_err(Into::into)
+        self.inner
+            .load_user_receipt(receipt_type, receipt_thread, user_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Load the receipts for an event in this room from storage.
@@ -3568,7 +3588,7 @@ impl Room {
     ///
     /// * `receipt_type` - The type of receipt to get.
     ///
-    /// * `thread` - The thread containing the event of the receipt, if any.
+    /// * `receipt_thread` - The thread a receipt applies to.
     ///
     /// * `event_id` - The ID of the event.
     ///
@@ -3577,10 +3597,13 @@ impl Room {
     pub async fn load_event_receipts(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         event_id: &EventId,
     ) -> Result<Vec<(OwnedUserId, Receipt)>> {
-        self.inner.load_event_receipts(receipt_type, thread, event_id).await.map_err(Into::into)
+        self.inner
+            .load_event_receipts(receipt_type, receipt_thread, event_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Get the push-condition context for this room.
@@ -4825,7 +4848,8 @@ mod tests {
         use matrix_sdk_base::store::RoomLoadSettings;
         use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, message_like_event_content};
 
-        let sqlite_path = std::env::temp_dir().join("cache_invalidation_while_encrypt.db");
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let sqlite_path = tmp_dir.path().join("cache_invalidation_while_encrypt.db");
         let session = mock_matrix_session();
 
         let client = Client::builder()
