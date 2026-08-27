@@ -27,7 +27,8 @@ use matrix_sdk::STATE_STORE_DATABASE_NAME;
 #[cfg(not(target_family = "wasm"))]
 use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 use matrix_sdk::{
-    Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
+    Account, AuthApi, AuthSession, Client as MatrixClient, Error, HttpError, SessionChange,
+    SessionTokens,
     authentication::oauth::{
         ClientId, OAuthAuthorizationData, OAuthError as SdkOAuthError, OAuthSession,
     },
@@ -82,13 +83,17 @@ use ruma::{
     api::{
         FeatureFlag,
         client::{
+            account::change_password,
             alias::get_alias,
             discovery::get_authorization_server_metadata::v1::{
                 AccountManagementActionData, DeviceDeleteData, DeviceViewData,
             },
             profile::{AvatarUrl, Call, DisplayName, ProfileFieldName, Status},
             room::create_room::{RoomPowerLevelsContentOverride, v3::CreationContent},
-            uiaa::{EmailUserIdentifier, UserIdentifier},
+            uiaa::{
+                AuthData as RumaAuthData, AuthType, EmailUserIdentifier, Password as RumaPassword,
+                UserIdentifier,
+            },
         },
         error::ErrorKind,
     },
@@ -385,6 +390,41 @@ impl From<request_openid_token::v3::Response> for OpenIdToken {
             expires_in_seconds: value.expires_in.as_secs(),
         }
     }
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum PasswordChangeError {
+    #[error("The current password is incorrect.")]
+    InvalidCurrentPassword,
+    #[error("{message}")]
+    WeakPassword { message: String },
+    #[error("The homeserver does not support password verification for this account.")]
+    UnsupportedAuthentication,
+    #[error("Unable to change the password. Check your connection and try again.")]
+    Unavailable,
+}
+
+fn password_change_request(
+    new_password: String,
+    auth: Option<RumaAuthData>,
+) -> change_password::v3::Request {
+    let mut request = change_password::v3::Request::new(new_password);
+    request.logout_devices = false;
+    request.auth = auth;
+    request
+}
+
+fn password_change_error(error: &HttpError) -> PasswordChangeError {
+    if matches!(error.client_api_error_kind(), Some(ErrorKind::WeakPassword)) {
+        return PasswordChangeError::WeakPassword {
+            message: error
+                .as_client_api_error()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "The homeserver rejected the new password.".to_owned()),
+        };
+    }
+    PasswordChangeError::Unavailable
 }
 
 struct ClientDelegateData {
@@ -2018,6 +2058,44 @@ impl Client {
         Ok(())
     }
 
+    /// Changes the password after completing password UIAA without revoking other devices.
+    pub async fn change_password(
+        &self,
+        current_password: String,
+        new_password: String,
+    ) -> Result<(), PasswordChangeError> {
+        let challenge = self.inner.send(password_change_request(new_password.clone(), None)).await;
+        let uiaa = match challenge {
+            Ok(_) => return Ok(()),
+            Err(error) => match error.as_uiaa_response() {
+                Some(info) => info.clone(),
+                None => return Err(password_change_error(&error)),
+            },
+        };
+
+        if !uiaa.flows.iter().any(|flow| flow.stages.as_slice() == [AuthType::Password]) {
+            return Err(PasswordChangeError::UnsupportedAuthentication);
+        }
+
+        let user_id = self.inner.user_id().ok_or(PasswordChangeError::Unavailable)?.to_owned();
+        let mut password = RumaPassword::new(user_id.into(), current_password);
+        password.session = uiaa.session;
+
+        match self
+            .inner
+            .send(password_change_request(new_password, Some(RumaAuthData::Password(password))))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error.as_uiaa_response().and_then(|info| info.auth_error.as_ref()).is_some() =>
+            {
+                Err(PasswordChangeError::InvalidCurrentPassword)
+            }
+            Err(error) => Err(password_change_error(&error)),
+        }
+    }
+
     /// Checks if a room alias is not in use yet.
     ///
     /// Returns:
@@ -3477,12 +3555,19 @@ pub struct ExtendedProfileFields {
 mod tests {
     use std::time::Duration;
 
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use ruma::{
         ServerName,
         api::client::room::{Visibility, create_room},
         authentication::TokenType,
         events::StateEventType,
         room::RoomType,
+    };
+    use serde_json::json;
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{body_json, method, path},
     };
 
     use crate::{
@@ -3554,6 +3639,59 @@ mod tests {
         assert_eq!(token.token_type, "Bearer");
         assert_eq!(token.matrix_server_name, "example.com");
         assert_eq!(token.expires_in_seconds, 3_600);
+    }
+
+    #[tokio::test]
+    async fn test_change_password_preserves_existing_sessions() {
+        let server = MatrixMockServer::new().await;
+        let sdk_client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.cross_process_store_config(CrossProcessLockConfig::SingleProcess)
+            })
+            .build()
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/_matrix/client/v3/account/password"))
+            .and(body_json(json!({
+                "new_password": "new-secret",
+                "logout_devices": false
+            })))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "flows": [{ "stages": ["m.login.password"] }],
+                "params": {},
+                "session": "password-uiaa-session"
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/_matrix/client/v3/account/password"))
+            .and(body_json(json!({
+                "new_password": "new-secret",
+                "logout_devices": false,
+                "auth": {
+                    "type": "m.login.password",
+                    "identifier": {
+                        "type": "m.id.user",
+                        "user": "@example:localhost"
+                    },
+                    "password": "current-secret",
+                    "session": "password-uiaa-session"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let client = super::Client::new(sdk_client, None, None).await.expect("FFI client");
+        client
+            .change_password("current-secret".to_owned(), "new-secret".to_owned())
+            .await
+            .expect("password change");
     }
 
     /// Dropping an FFI [`Client`] on a non-tokio thread must not panic.
