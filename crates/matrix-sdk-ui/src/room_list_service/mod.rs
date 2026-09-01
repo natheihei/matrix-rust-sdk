@@ -129,6 +129,9 @@ pub struct RoomListService {
     ///
     /// `RoomListService` is a simple state-machine.
     state_machine: StateMachine,
+
+    /// State requested in addition to the room list service defaults.
+    additional_required_state: Vec<(StateEventType, String)>,
 }
 
 impl RoomListService {
@@ -162,6 +165,25 @@ impl RoomListService {
         connection_id: &str,
         timeline_limit: u32,
         profiles_extension: bool,
+    ) -> Result<Self, Error> {
+        Self::new_with_additional_required_state(
+            client,
+            share_pos,
+            connection_id,
+            timeline_limit,
+            profiles_extension,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_additional_required_state(
+        client: Client,
+        share_pos: bool,
+        connection_id: &str,
+        timeline_limit: u32,
+        profiles_extension: bool,
+        additional_required_state: Vec<(StateEventType, String)>,
     ) -> Result<Self, Error> {
         let mut builder = client
             .sliding_sync(connection_id)
@@ -231,12 +253,7 @@ impl RoomListService {
                             .add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
                     )
                     .timeline_limit(timeline_limit)
-                    .required_state(
-                        DEFAULT_REQUIRED_STATE
-                            .iter()
-                            .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
-                            .collect(),
-                    )
+                    .required_state(required_state(&additional_required_state))
                     .filters(Some(assign!(http::request::ListFilters::default(), {
                         // As defined in the [SlidingSync MSC](https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444)
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
@@ -278,7 +295,7 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self { client, sliding_sync, state_machine })
+        Ok(Self { client, sliding_sync, state_machine, additional_required_state })
     }
 
     /// Start to sync the room list.
@@ -497,7 +514,7 @@ impl RoomListService {
 
         self.sliding_sync.set_room_subscriptions(
             room_ids,
-            Some(room_subscription_settings()),
+            Some(room_subscription_settings(&self.additional_required_state)),
             cancel_in_flight_request,
         )
     }
@@ -532,11 +549,21 @@ impl RoomListService {
     }
 }
 
-fn room_subscription_settings() -> http::request::RoomSubscription {
+fn required_state(
+    additional_required_state: &[(StateEventType, String)],
+) -> Vec<(StateEventType, String)> {
+    DEFAULT_REQUIRED_STATE
+        .iter()
+        .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
+        .chain(additional_required_state.iter().cloned())
+        .collect()
+}
+
+fn room_subscription_settings(
+    additional_required_state: &[(StateEventType, String)],
+) -> http::request::RoomSubscription {
     assign!(http::request::RoomSubscription::default(), {
-        required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
-            (state_event.clone(), (*value).to_owned())
-        })
+        required_state: required_state(additional_required_state).into_iter()
         .chain(
             DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
                 (state_event.clone(), (*value).to_owned())
@@ -595,9 +622,25 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
     use matrix_sdk::{SlidingSyncMode, test_utils::mocks::MatrixMockServer};
     use matrix_sdk_test::{TestError, async_test};
-    use ruma::{api::client::sync::sync_events::v5, assign, uint};
+    use ruma::{api::client::sync::sync_events::v5, assign, events::StateEventType, uint};
 
-    use super::{ALL_ROOMS_LIST_NAME, Error, RoomListService, State};
+    use super::{
+        ALL_ROOMS_LIST_NAME, Error, RoomListService, State, required_state,
+        room_subscription_settings,
+    };
+
+    #[test]
+    fn additional_required_state_is_used_for_lists_and_subscriptions() {
+        let bridge_state = (StateEventType::from("m.bridge"), "*".to_owned());
+        let additional_required_state = [bridge_state.clone()];
+
+        assert!(required_state(&additional_required_state).contains(&bridge_state));
+        assert!(
+            room_subscription_settings(&additional_required_state)
+                .required_state
+                .contains(&bridge_state)
+        );
+    }
 
     #[async_test]
     async fn test_all_rooms_are_declared() -> Result<(), TestError> {
