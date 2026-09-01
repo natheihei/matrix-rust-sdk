@@ -23,6 +23,7 @@ use matrix_sdk_ui::{
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
+use ruma::events::StateEventType;
 
 use crate::{
     TaskHandle, error::ClientError, helpers::unwrap_or_clone_arc, platform::tracing::Span,
@@ -156,6 +157,16 @@ impl SyncServiceBuilder {
     pub fn with_room_list_timeline_limit(self: Arc<Self>, limit: u32) -> Arc<Self> {
         let this = unwrap_or_clone_arc(self);
         let builder = this.builder.with_room_list_timeline_limit(limit);
+        Arc::new(Self { builder, ..this })
+    }
+
+    /// Request all state keys for the given event types in room list syncs.
+    pub fn with_room_list_additional_state_event_types(
+        self: Arc<Self>,
+        event_types: Vec<StateEventType>,
+    ) -> Arc<Self> {
+        let this = unwrap_or_clone_arc(self);
+        let builder = this.builder.with_room_list_additional_state_event_types(event_types);
         Arc::new(Self { builder, ..this })
     }
 

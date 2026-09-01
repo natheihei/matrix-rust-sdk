@@ -38,7 +38,7 @@ use ruma::{
     EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
     ServerName, UserId, assign,
     events::{
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
+        AnyMessageLikeEventContent, AnySyncTimelineEvent, StateEventType,
         receipt::ReceiptThread as RumaReceiptThread,
         relation::RelationType as RumaRelationType,
         room::{
@@ -329,6 +329,22 @@ impl Room {
 
     async fn latest_event(&self) -> LatestEventValue {
         self.inner.latest_event().await.into()
+    }
+
+    /// Get all state events of the given type as raw JSON strings.
+    ///
+    /// Joined and left rooms return full sync state events. Invited rooms return
+    /// stripped invite state events.
+    pub async fn get_state_events(
+        &self,
+        event_type: StateEventType,
+    ) -> Result<Vec<String>, ClientError> {
+        self.inner
+            .get_state_events(event_type)
+            .await?
+            .into_iter()
+            .map(|event| serde_json::to_string(&event).map_err(ClientError::from))
+            .collect()
     }
 
     pub async fn latest_encryption_state(&self) -> Result<EncryptionState, ClientError> {
@@ -2145,7 +2161,12 @@ impl TryFrom<SdkRoomSendQueueUpdate> for RoomSendQueueUpdate {
 mod tests {
     use std::time::Duration;
 
-    use matrix_sdk::{ruma::room_id, test_utils::mocks::MatrixMockServer};
+    use matrix_sdk::{
+        ruma::{events::StateEventType, room_id, serde::Raw},
+        test_utils::mocks::MatrixMockServer,
+    };
+    use matrix_sdk_test::{InvitedRoomBuilder, JoinedRoomBuilder};
+    use serde_json::{Value, json, value::to_raw_value};
     use tempfile::tempdir;
 
     use super::*;
@@ -2186,5 +2207,57 @@ mod tests {
         std::thread::spawn(move || drop(ffi_room))
             .join()
             .expect("Room::drop panicked on a non-tokio thread");
+    }
+
+    #[tokio::test]
+    async fn get_state_events_returns_sync_and_stripped_json() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let joined_room_id = room_id!("!joined:example.com");
+        let invited_room_id = room_id!("!invited:example.com");
+        let joined_event = json!({
+            "content": { "protocol": { "id": "whatsapp" } },
+            "event_id": "$bridge:example.com",
+            "origin_server_ts": 1,
+            "sender": "@bridge:example.com",
+            "state_key": "bridge-id",
+            "type": "m.bridge",
+            "unsigned": { "extension": "preserved" }
+        });
+        let invited_event = json!({
+            "content": { "protocol": { "id": "whatsapp" } },
+            "sender": "@bridge:example.com",
+            "state_key": "bridge-id",
+            "type": "m.bridge",
+            "extension": { "preserved": true }
+        });
+
+        let joined_room = server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(joined_room_id)
+                    .add_state_event(Raw::from_json(to_raw_value(&joined_event).unwrap())),
+            )
+            .await;
+        let invited_room = server
+            .sync_room(
+                &client,
+                InvitedRoomBuilder::new(invited_room_id)
+                    .add_state_event(Raw::from_json(to_raw_value(&invited_event).unwrap())),
+            )
+            .await;
+
+        let event_type = StateEventType::from("m.bridge");
+        let joined_events =
+            Room::new(joined_room, None).get_state_events(event_type.clone()).await.unwrap();
+        let invited_events =
+            Room::new(invited_room, None).get_state_events(event_type).await.unwrap();
+
+        assert_eq!(joined_events.len(), 1);
+        assert_eq!(invited_events.len(), 1);
+        let joined_json: Value = serde_json::from_str(&joined_events[0]).unwrap();
+        let invited_json: Value = serde_json::from_str(&invited_events[0]).unwrap();
+        assert_eq!(joined_json, joined_event);
+        assert_eq!(invited_json, invited_event);
     }
 }
