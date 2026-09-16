@@ -2925,6 +2925,9 @@ pub struct CreateRoomParameters {
     pub canonical_alias: Option<String>,
     #[uniffi(default = false)]
     pub is_space: bool,
+    /// Optional immutable room purpose. `is_space` takes precedence for space rooms.
+    #[uniffi(default = None)]
+    pub room_type: Option<String>,
 }
 
 impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
@@ -2979,9 +2982,13 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
 
         request.initial_state = initial_state;
 
-        if value.is_space {
+        if value.is_space || value.room_type.is_some() {
             let mut creation_content = CreationContent::new();
-            creation_content.room_type = Some(RoomType::Space);
+            creation_content.room_type = if value.is_space {
+                Some(RoomType::Space)
+            } else {
+                value.room_type.map(|value| RoomType::from(value.as_str()))
+            };
             request.creation_content = Some(Raw::new(&creation_content)?);
         }
 
@@ -3619,6 +3626,7 @@ mod tests {
             history_visibility_override: Some(RoomHistoryVisibility::Shared),
             canonical_alias: Some("#a-room:example.com".to_owned()),
             is_space: true,
+            room_type: Some("figment.task".to_owned()),
         };
 
         let request: create_room::v3::Request =
@@ -3650,6 +3658,56 @@ mod tests {
             .expect("Creation content can't be deserialized")
             .room_type;
         assert_eq!(room_type, Some(RoomType::Space));
+    }
+
+    #[test]
+    fn test_create_custom_room_type_mapping() {
+        let params = CreateRoomParameters {
+            name: Some("A room".to_owned()),
+            topic: Some("A topic".to_owned()),
+            is_encrypted: true,
+            is_direct: true,
+            visibility: RoomVisibility::Public,
+            preset: RoomPreset::PublicChat,
+            invite: Some(vec!["@user:example.com".to_owned()]),
+            avatar: Some("http://example.com/avatar.jpg".to_owned()),
+            power_level_content_override: None,
+            join_rule_override: Some(JoinRule::Knock),
+            history_visibility_override: Some(RoomHistoryVisibility::Shared),
+            canonical_alias: Some("#a-room:example.com".to_owned()),
+            is_space: false,
+            room_type: Some("figment.task".to_owned()),
+        };
+
+        let request: create_room::v3::Request =
+            params.try_into().expect("CreateRoomParameters couldn't be transformed into a Request");
+        let initial_state = request
+            .initial_state
+            .iter()
+            .map(|raw| raw.deserialize().expect("Initial state event failed to deserialize"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(request.name, Some("A room".to_owned()));
+        assert_eq!(request.topic, Some("A topic".to_owned()));
+        assert!(initial_state.iter().any(|e| e.event_type() == StateEventType::RoomEncryption));
+        assert!(request.is_direct);
+        assert_eq!(request.visibility, Visibility::Public);
+        assert_eq!(request.preset, Some(create_room::v3::RoomPreset::PublicChat));
+        assert_eq!(request.invite.len(), 1);
+        assert!(initial_state.iter().any(|e| e.event_type() == StateEventType::RoomAvatar));
+        assert!(initial_state.iter().any(|e| e.event_type() == StateEventType::RoomJoinRules));
+        assert!(
+            initial_state.iter().any(|e| e.event_type() == StateEventType::RoomHistoryVisibility)
+        );
+        assert_eq!(request.room_alias_name, Some("#a-room:example.com".to_owned()));
+
+        let room_type = request
+            .creation_content
+            .expect("Creation content is missing")
+            .deserialize()
+            .expect("Creation content can't be deserialized")
+            .room_type;
+        assert_eq!(room_type, Some(RoomType::from("figment.task")));
     }
 
     #[test]
